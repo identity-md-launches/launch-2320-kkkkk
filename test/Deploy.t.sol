@@ -23,8 +23,20 @@ contract DeployTest is KeelTest {
         assertEq(uint160(address(nextHook)) & Hooks.ALL_HOOK_MASK, nextHook.PERMISSION_FLAGS());
         vm.startPrank(successor);
         nextFactory.configureQuote(address(0), true, -600000, 600000, false, false);
-        nextFactory.launch("kkkkk", "lllll", "", address(0), -230280, 300);
+        nextFactory.setSigner(signer);
         vm.stopPrank();
+        assertEq(nextFactory.router(), address(0));
+        assertEq(nextFactory.heart(), address(0));
+        assertEq(nextFactory.launchFee(), 0.0001 ether);
+        uint256 deadline = vm.getBlockTimestamp() + 1;
+        (uint8 v, bytes32 r, bytes32 s) =
+            vm.sign(signerKey, nextFactory.launchDigest(successor, address(0), -230280, deadline, 0));
+        vm.deal(successor, 1 ether);
+        vm.prank(successor);
+        nextFactory.launch{value: 0.0001 ether}(
+            "kkkkk", "lllll", "", address(0), -230280, 300, deadline, abi.encodePacked(r, s, v)
+        );
+        assertEq(team.balance, 0.0001 ether);
     }
 
     function test_dryRunRejectsWrongChainAndMissingOwner() public {

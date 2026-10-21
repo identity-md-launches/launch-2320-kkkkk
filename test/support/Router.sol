@@ -30,9 +30,28 @@ contract Router is Guard {
     function swap(PoolKey memory key, SwapParams memory params, uint256 deposit, address to)
         external
         payable
-        nonReentrant
         returns (BalanceDelta delta)
     {
+        return _swap(key, params, deposit, to, "");
+    }
+
+    function swap(
+        PoolKey memory key,
+        SwapParams memory params,
+        uint256 deposit,
+        address to,
+        bytes memory data
+    ) external payable returns (BalanceDelta delta) {
+        return _swap(key, params, deposit, to, data);
+    }
+
+    function _swap(
+        PoolKey memory key,
+        SwapParams memory params,
+        uint256 deposit,
+        address to,
+        bytes memory data
+    ) private nonReentrant returns (BalanceDelta delta) {
         Currency input = params.zeroForOne ? key.currency0 : key.currency1;
         if (Currency.unwrap(input) == address(0)) {
             require(msg.value == deposit);
@@ -42,7 +61,7 @@ contract Router is Guard {
             require(IERC20Test(Currency.unwrap(input)).transferFrom(msg.sender, address(this), deposit));
             require(input.balanceOfSelf() == beforeBalance + deposit);
         }
-        bytes memory result = manager.unlock(abi.encode(uint8(0), abi.encode(key, params, deposit, to)));
+        bytes memory result = manager.unlock(abi.encode(uint8(0), abi.encode(key, params, deposit, to, data)));
         delta = abi.decode(result, (BalanceDelta));
     }
 
@@ -59,8 +78,8 @@ contract Router is Guard {
             manager.modifyLiquidity(liquidityKey, liquidityParams, "");
             return "";
         }
-        (PoolKey memory key, SwapParams memory params, uint256 deposit, address to) =
-            abi.decode(payload, (PoolKey, SwapParams, uint256, address));
+        (PoolKey memory key, SwapParams memory params, uint256 deposit, address to, bytes memory hookData) =
+            abi.decode(payload, (PoolKey, SwapParams, uint256, address, bytes));
         Currency input = params.zeroForOne ? key.currency0 : key.currency1;
         Currency output = params.zeroForOne ? key.currency1 : key.currency0;
         manager.sync(input);
@@ -70,7 +89,7 @@ contract Router is Guard {
             require(IERC20Test(Currency.unwrap(input)).transfer(address(manager), deposit));
             require(manager.settle() == deposit);
         }
-        BalanceDelta delta = manager.swap(key, params, "");
+        BalanceDelta delta = manager.swap(key, params, hookData);
         int128 inputDelta = params.zeroForOne ? delta.amount0() : delta.amount1();
         int128 outputDelta = params.zeroForOne ? delta.amount1() : delta.amount0();
         require(inputDelta <= 0 && outputDelta >= 0);

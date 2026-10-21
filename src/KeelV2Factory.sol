@@ -37,21 +37,39 @@ contract KeelV2Factory is Guard {
     error InvalidCallback();
     error InvalidLiquidity();
     error AlreadySet();
+    error InvalidFee();
+    error WrongFee();
+    error PermitExpired();
+    error InvalidSignature();
+    error FeeTransferFailed();
 
     int24 public constant TICK_SPACING = 60;
     int24 public constant MAX_TICK = 887220;
     uint256 public constant SUPPLY = 1_000_000_000 ether;
+    uint256 public constant MAX_LAUNCH_FEE = 0.01 ether;
+    bytes32 public constant LAUNCH_TYPEHASH =
+        keccak256("Launch(address creator,address quote,int24 startTick,uint256 deadline,uint256 nonce)");
+    bytes32 private constant _DOMAIN_TYPEHASH =
+        keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
+    bytes32 private constant _NAME_HASH = keccak256("Keel");
+    bytes32 private constant _VERSION_HASH = keccak256("2");
+    uint256 private constant _HALF_ORDER = 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0;
     IPoolManager public immutable poolManager;
     address private immutable _bootstrap;
     address public owner;
     address public pendingOwner;
     address public teamRecipient;
     address public takeoverContract;
+    address public router;
+    address public heart;
+    address public signer;
+    uint256 public launchFee = 0.0001 ether;
     KeelV2Hook public hook;
     address public currentModule;
     uint32 public decaySeconds = 120;
     bool public launchesPaused;
     bool private _unlocking;
+    mapping(address => uint256) public nonces;
 
     struct QuoteConfig {
         bool enabled;
@@ -83,6 +101,11 @@ contract KeelV2Factory is Guard {
     event ModuleRegistered(address indexed module);
     event TeamRecipientChanged(address indexed previousRecipient, address indexed newRecipient);
     event TakeoverContractSet(address indexed takeoverContract);
+    event RouterSet(address indexed router);
+    event HeartSet(address indexed heart);
+    event SignerChanged(address indexed previousSigner, address indexed newSigner);
+    event LaunchFeeChanged(uint256 launchFee);
+    event LaunchFeePaid(address indexed token, address indexed creator, address indexed to, uint256 amount);
     event Launched(
         address indexed token,
         bytes32 indexed poolId,
@@ -192,16 +215,75 @@ contract KeelV2Factory is Guard {
         emit TakeoverContractSet(takeover);
     }
 
+    /// @notice Set-once production router. Only its buys can name a buyer for the heart.
+    function setRouter(address router_) external onlyOwner {
+        if (router != address(0)) revert AlreadySet();
+        if (router_ == address(0) || router_.code.length == 0) revert InvalidAddress();
+        router = router_;
+        emit RouterSet(router_);
+    }
+
+    /// @notice Set-once heart. Unset means buys never reach a heart and every buy feeds the pulse.
+    function setHeart(address heart_) external onlyOwner {
+        if (heart != address(0)) revert AlreadySet();
+        if (heart_ == address(0) || heart_.code.length == 0) revert InvalidAddress();
+        heart = heart_;
+        emit HeartSet(heart_);
+    }
+
+    /// @notice Replaceable off-chain permit signer. Launches revert until one is set.
+    function setSigner(address signer_) external onlyOwner {
+        if (signer_ == address(0)) revert InvalidAddress();
+        address previous = signer;
+        signer = signer_;
+        emit SignerChanged(previous, signer_);
+    }
+
+    function setLaunchFee(uint256 fee) external onlyOwner {
+        if (fee > MAX_LAUNCH_FEE) revert InvalidFee();
+        launchFee = fee;
+        emit LaunchFeeChanged(fee);
+    }
+
+    function DOMAIN_SEPARATOR() public view returns (bytes32) {
+        return
+            keccak256(abi.encode(_DOMAIN_TYPEHASH, _NAME_HASH, _VERSION_HASH, block.chainid, address(this)));
+    }
+
+    /// @notice EIP-712 digest of a launch permit for `creator` at its current nonce.
+    function launchDigest(address creator, address quote, int24 startTick, uint256 deadline, uint256 nonce)
+        public
+        view
+        returns (bytes32)
+    {
+        return keccak256(
+            abi.encodePacked(
+                "\x19\x01",
+                DOMAIN_SEPARATOR(),
+                keccak256(abi.encode(LAUNCH_TYPEHASH, creator, quote, startTick, deadline, nonce))
+            )
+        );
+    }
+
+    /// @notice Creates a token and its pool. `msg.value` must equal `launchFee` and goes to the team.
+    /// @dev The permit binds creator, quote, start tick, deadline and the creator's nonce; the signer
+    ///      chooses the tick off chain so each launch starts at the intended market cap.
     function launch(
         string calldata name,
         string calldata symbol,
         string calldata metadata,
         address quote,
         int24 startTick,
-        uint16 baseFeeBps
-    ) external nonReentrant returns (address token, bytes32 poolId) {
+        uint16 baseFeeBps,
+        uint256 deadline,
+        bytes calldata signature
+    ) external payable nonReentrant returns (address token, bytes32 poolId) {
         if (launchesPaused) revert LaunchesPaused();
-        if (address(hook) == address(0) || currentModule == address(0)) revert NotConfigured();
+        if (address(hook) == address(0) || currentModule == address(0) || signer == address(0)) {
+            revert NotConfigured();
+        }
+        if (msg.value != launchFee) revert WrongFee();
+        if (block.timestamp > deadline) revert PermitExpired();
         QuoteConfig memory config = quotes[quote];
         if (!config.enabled) revert QuoteNotAllowed();
         if (
@@ -213,6 +295,7 @@ contract KeelV2Factory is Guard {
             bytes(name).length == 0 || bytes(name).length > 64 || bytes(symbol).length == 0
                 || bytes(symbol).length > 16 || bytes(metadata).length > 2048
         ) revert InvalidMetadata();
+        _consumePermit(quote, startTick, deadline, signature);
         token = address(new KeelV2Token(name, symbol));
         bool token0 = token < quote;
         PoolKey memory key = PoolKey(
@@ -238,6 +321,12 @@ contract KeelV2Factory is Guard {
         poolManager.unlock(abi.encode(token));
         _unlocking = false;
         emit Launched(token, poolId, msg.sender, quote, startTick, baseFeeBps, metadata);
+        if (msg.value != 0) {
+            address to = teamRecipient;
+            (bool ok,) = to.call{value: msg.value}("");
+            if (!ok) revert FeeTransferFailed();
+            emit LaunchFeePaid(token, msg.sender, to, msg.value);
+        }
     }
 
     function launchInfo(address token) external view returns (LaunchInfo memory) {
@@ -275,6 +364,20 @@ contract KeelV2Factory is Guard {
         if (dust != 0) poolManager.clear(Currency.wrap(token), dust);
         emit LiquidityLocked(token, info.liquidity, used, dust);
         return "";
+    }
+
+    function _consumePermit(address quote, int24 startTick, uint256 deadline, bytes calldata signature)
+        private
+    {
+        uint256 nonce = nonces[msg.sender]++;
+        bytes32 digest = launchDigest(msg.sender, quote, startTick, deadline, nonce);
+        if (signature.length != 65) revert InvalidSignature();
+        bytes32 r = bytes32(signature[0:32]);
+        bytes32 s = bytes32(signature[32:64]);
+        uint8 v = uint8(signature[64]);
+        if (uint256(s) > _HALF_ORDER || (v != 27 && v != 28)) revert InvalidSignature();
+        address recovered = ecrecover(digest, v, r, s);
+        if (recovered == address(0) || recovered != signer) revert InvalidSignature();
     }
 
     function _setModule(address module_) private {

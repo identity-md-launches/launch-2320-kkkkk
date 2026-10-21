@@ -423,7 +423,8 @@ contract FeesTest is KeelTest {
         hook.claimCreator(address(token), address(receiver));
         assertTrue(receiver.attempted());
         assertFalse(receiver.reentered());
-        assertEq(address(receiver).balance, creatorCredit);
+        // The team recipient also received the launch fee when the pool was created.
+        assertEq(address(receiver).balance, creatorCredit + 0.0001 ether);
         assertEq(hook.teamFees(address(0), address(receiver)), teamCredit);
         _assertSolvent(address(0));
     }

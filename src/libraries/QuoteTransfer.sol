@@ -24,4 +24,12 @@ library QuoteTransfer {
             if (!ok || (result.length != 0 && !abi.decode(result, (bool)))) revert TransferFailed();
         }
     }
+
+    /// @dev ERC20 only; the caller checks its own balance change.
+    function pull(address quote, address from, uint256 amount) internal {
+        (bool ok, bytes memory result) = quote.call(
+            abi.encodeWithSignature("transferFrom(address,address,uint256)", from, address(this), amount)
+        );
+        if (!ok || (result.length != 0 && !abi.decode(result, (bool)))) revert TransferFailed();
+    }
 }

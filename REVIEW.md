@@ -17,6 +17,22 @@ This is an implementation self-review, not an independent audit. No deployment o
 | Integer liquidity cannot consume an arbitrary exact token supply. | The whole supply is transferred to PoolManager. The quantization remainder is irrevocably cleared, and principal/dust are separately emitted and recorded. Factory position ownership and the absence of a removal path lock liquidity. |
 | Quote fees may be taken before a conventional router settles input. | Test routing settles upfront. Production routing must do the same or rely on sufficient existing PoolManager quote inventory. The README explicitly records this integration requirement. |
 
+## Part 2a findings and disposition
+
+| Finding | Disposition and evidence |
+|---|---|
+| An eager 70/30 split over up to 16 quotes at round end would cost 16 × ~30k gas and could never fit the 120k `onBuy` budget. | Pots are split lazily from per-quote funding anchors; ending a round writes two slots. `onBuy` is measured on every path (≤ 119,766 gas with a 400-checkpoint winner) and asserted ≤ 120,000. The conservation `liability = potOf + Σ unpaid prizes` is an invariant. |
+| A heart that reverts, burns gas or is slow must not affect swaps. | `onBuy` runs under a fixed 200k stipend inside `try/catch`; `minBuy` is also wrapped. Tests cover a reverting heart (mocked revert), a gas-burning heart and a reverting heart on fresh deployments, asserting the swap succeeds, the pulse updates and the burn costs at most the stipend. A fuzz test replays identical sequences with and without a heart on a state snapshot and compares every delta. |
+| Buyer identity could be spoofed through hook data. | The hook accepts a buyer only when PoolManager's `sender` is the set-once `factory.router()` and the payload is exactly 32 bytes. Tests cover a non-router with a 32-byte payload, the router with 20-byte and 64-byte payloads and empty data. |
+| The ending block must not be gameable. | `KeelV2Token.balanceAt` still rejects the current block, and the heart checks `block.number − 1`. Tests cover: holding, selling one unit, selling and buying back before the end, receiving by transfer, moving tokens in and out inside the `end()` block, and `end()` called 200,000 blocks late. |
+| Permit replay and malleability. | Per-creator nonce increments on use; the signature must be 65 bytes, low-`s`, `v ∈ {27,28}`, and recover to the current signer. Tests cover replay, changed creator/quote/tick/deadline, wrong signer, empty signature, flipped `v`, expiry at the boundary, chain-id change and signer replacement. |
+| Launch fee custody. | `msg.value` must equal `launchFee` exactly and is forwarded to `teamRecipient` in the same call after all state changes under the factory's reentrancy lock; failure reverts the launch and the nonce. The factory never holds ETH (asserted). |
+| `FixedRateModule` refactor. | Behaviour is identical; it now inherits `RateModuleBase`. All part 1 rule tests pass unchanged apart from the error namespace. |
+| Timer and bookkeeping are packed into two slots (`Live`, `LastBuy`). | `uint40 deadline`, `uint24 round` and `uint24 eligibleRounds` (≥ 300 s per round gives > 150 years), `uint96 lastTokens` (supply is 1e27 < 2^96; larger values saturate). `uint224` pot amounts; funding beyond that reverts. |
+| Pulse arithmetic. | `PulseMath.decay` is fuzzed over the full `uint128 × uint256` domain for no-revert, monotonicity and exact shifts on whole half-lives; saturation at `uint128.max` is tested by storage injection. |
+
+Part 2a remaining limits: the holding check costs about 2.1k gas per doubling of the winner's checkpoint history, so an extreme history (more than ~2^38 checkpoints) would exhaust the 200k stipend and the round would only end through `end()`. The heart trusts `KeelV2Token.balanceAt`, which only factory-created tokens provide; the hook only registers such tokens. Lazy pot settlement means `prizeOf`/`potOf` walk at most ~150 eligible rounds (the pot rounds to zero after that) per anchor. A quote added to the heart after rounds have run has a zero pot for earlier rounds. The owner's only powers are thresholds and the quote list; a wrong `minBuy` can only make buys not count.
+
 ## Static-analysis dispositions
 
 The high-severity-only Slither run finished with **0 results** after the following changes, without detector suppression or path exclusions:
@@ -53,7 +69,19 @@ The owner is trusted to admit standard quotes and audited immutable modules. Ext
 
 The takeover contract, production router/frontend, final quote allowlist and bounds, and actual owner/team deployment addresses are operator decisions for the later release. The supplied dry run leaves takeover unset and quote allowlisting empty. An independent review is still required before using real funds.
 
-## Validation results
+## Validation results (part 2a)
+
+Completed on 2026-10-21 with the pinned Solidity 0.8.26 configuration, offline, with the verifier's fuzz seed `0x32f35d2cad9bfd8f60ebb888f94a34d8b3199251ef9873d5ed13d3f0e8890a26`:
+
+| Check | Result |
+|---|---|
+| `forge build --offline` | Passed. Runtime sizes: factory 14,638, hook 11,641, heart 6,005, token 2,153, FixedRateModule 1,670, PulseRateModule 1,979 bytes. |
+| `forge test --offline --fuzz-seed 0x32f3…0a26` | **107 passed, 0 failed, 1 explicit mainnet-only skip** across 18 suites. `FeeInvariantTest` and `HeartInvariantTest` each ran 128 sequences / 4,096 calls with 0 reverts. |
+| `forge fmt --check` | Passed. |
+| `forge snapshot --match-contract GasWith` | Recorded in `.gas-snapshot` and the README gas section. |
+| Slither / Mythril / mainnet fork | Not run in this part (no network in this run; the fork suite is opt-in as before). |
+
+## Validation results (part 1)
 
 Completed on 2026-10-20 with the pinned Solidity 0.8.26 configuration:
 

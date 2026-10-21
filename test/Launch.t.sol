@@ -94,8 +94,9 @@ contract LaunchTest is KeelTest {
         (,, PoolKey memory key) = _launch(address(0), 300);
         vm.prank(owner);
         factory.setLaunchesPaused(true);
-        vm.expectRevert(KeelV2Factory.LaunchesPaused.selector);
-        factory.launch("k", "l", "", address(0), -230280, 300);
+        _launchExpecting(
+            KeelV2Factory.LaunchesPaused.selector, creator, "k", "l", "", address(0), -230280, 300
+        );
         _mature();
         _buy(key, address(0), 0.01 ether);
         vm.prank(owner);
@@ -104,21 +105,19 @@ contract LaunchTest is KeelTest {
     }
 
     function test_launchValidation() public {
-        vm.expectRevert(KeelV2Factory.QuoteNotAllowed.selector);
-        factory.launch("k", "l", "", outsider, -230280, 300);
-        vm.expectRevert(KeelV2Factory.InvalidTicks.selector);
-        factory.launch("k", "l", "", address(0), -230281, 300);
-        vm.expectRevert(KeelV2Factory.InvalidTicks.selector);
-        factory.launch("k", "l", "", address(0), -600060, 300);
-        vm.expectRevert(KeelV2Factory.InvalidRate.selector);
-        factory.launch("k", "l", "", address(0), -230280, 99);
-        vm.expectRevert(KeelV2Factory.InvalidRate.selector);
-        factory.launch("k", "l", "", address(0), -230280, 501);
-        vm.expectRevert(KeelV2Factory.InvalidMetadata.selector);
-        factory.launch("", "l", "", address(0), -230280, 300);
+        _launchExpecting(
+            KeelV2Factory.QuoteNotAllowed.selector, creator, "k", "l", "", outsider, -230280, 300
+        );
+        _launchExpecting(KeelV2Factory.InvalidTicks.selector, creator, "k", "l", "", address(0), -230281, 300);
+        _launchExpecting(KeelV2Factory.InvalidTicks.selector, creator, "k", "l", "", address(0), -600060, 300);
+        _launchExpecting(KeelV2Factory.InvalidRate.selector, creator, "k", "l", "", address(0), -230280, 99);
+        _launchExpecting(KeelV2Factory.InvalidRate.selector, creator, "k", "l", "", address(0), -230280, 501);
+        _launchExpecting(
+            KeelV2Factory.InvalidMetadata.selector, creator, "", "l", "", address(0), -230280, 300
+        );
         KeelV2Factory unconfigured = new KeelV2Factory(manager, owner, team);
         vm.expectRevert(KeelV2Factory.NotConfigured.selector);
-        unconfigured.launch("k", "l", "", address(0), -230280, 300);
+        unconfigured.launch{value: 0.0001 ether}("k", "l", "", address(0), -230280, 300, block.timestamp, "");
     }
 
     function test_quoteClassificationAndBounds() public {
@@ -139,8 +138,7 @@ contract LaunchTest is KeelTest {
         factory.configureQuote(address(0), true, -230280, -230280, false, false);
         vm.stopPrank();
         _launch(address(0), 300);
-        vm.expectRevert(KeelV2Factory.InvalidTicks.selector);
-        factory.launch("k", "l", "", address(0), -230220, 300);
+        _launchExpecting(KeelV2Factory.InvalidTicks.selector, creator, "k", "l", "", address(0), -230220, 300);
     }
 
     function test_ownerPowersApplyOnlyToFuturePools() public {

@@ -32,6 +32,8 @@ abstract contract KeelTest is Test {
     address internal team = address(0x10004);
     address internal successor = address(0x10005);
     address internal outsider = address(0x10006);
+    uint256 internal signerKey = 0xA11CE;
+    address internal signer = vm.addr(0xA11CE);
     IPoolManager internal manager;
     KeelV2Factory internal factory;
     KeelV2Hook internal hook;
@@ -67,6 +69,7 @@ abstract contract KeelTest is Test {
         btc = new MockQuote(8);
         dai = new MockQuote(18);
         vm.startPrank(owner);
+        factory.setSigner(signer);
         factory.configureQuote(address(0), true, -600000, 600000, false, false);
         factory.configureQuote(address(usdc), true, -600000, 600000, false, false);
         factory.configureQuote(address(btc), true, -600000, 600000, false, false);
@@ -83,16 +86,68 @@ abstract contract KeelTest is Test {
         internal
         returns (KeelV2Token token, bytes32 id, PoolKey memory key)
     {
-        int24 tick = quote == address(usdc) || quote == MAINNET_USDC
-            ? int24(-414480)
-            : quote == address(btc) ? int24(-368400) : int24(-230280);
-        vm.startPrank(creator);
+        int24 tick = _tickFor(quote);
         (address deployed, bytes32 poolId) =
-            factory.launch("kkkkk", "lllll", "ipfs://keel", quote, tick, rate);
-        vm.stopPrank();
+            _launchAs(creator, "kkkkk", "lllll", "ipfs://keel", quote, tick, rate);
         token = KeelV2Token(deployed);
         id = poolId;
         key = factory.launchInfo(deployed).key;
+    }
+
+    function _tickFor(address quote) internal view returns (int24) {
+        return quote == address(usdc) || quote == MAINNET_USDC
+            ? int24(-414480)
+            : quote == address(btc) ? int24(-368400) : int24(-230280);
+    }
+
+    /// @dev Launches with a fresh valid permit and the exact launch fee from `who`.
+    function _launchAs(
+        address who,
+        string memory name,
+        string memory symbol,
+        string memory metadata,
+        address quote,
+        int24 tick,
+        uint16 rate
+    ) internal returns (address deployed, bytes32 poolId) {
+        uint256 deadline = vm.getBlockTimestamp() + 1 hours;
+        bytes memory signature = _permit(signerKey, who, quote, tick, deadline, factory.nonces(who));
+        uint256 fee = factory.launchFee();
+        vm.deal(who, who.balance + fee);
+        vm.startPrank(who);
+        (deployed, poolId) =
+            factory.launch{value: fee}(name, symbol, metadata, quote, tick, rate, deadline, signature);
+        vm.stopPrank();
+    }
+
+    /// @dev Same as `_launchAs`, expecting `launch` itself to revert with `expected`.
+    function _launchExpecting(
+        bytes4 expected,
+        address who,
+        string memory name,
+        string memory symbol,
+        string memory metadata,
+        address quote,
+        int24 tick,
+        uint16 rate
+    ) internal {
+        uint256 deadline = vm.getBlockTimestamp() + 1 hours;
+        bytes memory signature = _permit(signerKey, who, quote, tick, deadline, factory.nonces(who));
+        uint256 fee = factory.launchFee();
+        vm.deal(who, who.balance + fee);
+        vm.prank(who);
+        vm.expectRevert(expected);
+        factory.launch{value: fee}(name, symbol, metadata, quote, tick, rate, deadline, signature);
+    }
+
+    function _permit(uint256 key, address who, address quote, int24 tick, uint256 deadline, uint256 nonce)
+        internal
+        view
+        returns (bytes memory)
+    {
+        (uint8 v, bytes32 r, bytes32 s) =
+            vm.sign(key, factory.launchDigest(who, quote, tick, deadline, nonce));
+        return abi.encodePacked(r, s, v);
     }
 
     function _buy(PoolKey memory key, address quote, uint256 amount) internal returns (BalanceDelta) {
@@ -107,6 +162,25 @@ abstract contract KeelTest is Test {
         internal
         returns (BalanceDelta result)
     {
+        return _swapVia(router, key, input, amount, who, "");
+    }
+
+    /// @dev A buy that names `who` as the buyer, the way the production router does.
+    function _routerBuy(PoolKey memory key, address quote, uint256 amount, address who)
+        internal
+        returns (BalanceDelta)
+    {
+        return _swapVia(router, key, quote, amount, who, abi.encode(who));
+    }
+
+    function _swapVia(
+        Router via,
+        PoolKey memory key,
+        address input,
+        uint256 amount,
+        address who,
+        bytes memory hookData
+    ) internal returns (BalanceDelta result) {
         bool zeroForOne = Currency.unwrap(key.currency0) == input;
         SwapParams memory params = SwapParams(
             zeroForOne,
@@ -114,8 +188,8 @@ abstract contract KeelTest is Test {
             zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
         );
         vm.startPrank(who);
-        if (input != address(0)) assertTrue(IERC20Test(input).approve(address(router), amount));
-        result = router.swap{value: input == address(0) ? amount : 0}(key, params, amount, who);
+        if (input != address(0)) assertTrue(IERC20Test(input).approve(address(via), amount));
+        result = via.swap{value: input == address(0) ? amount : 0}(key, params, amount, who, hookData);
         vm.stopPrank();
     }
 

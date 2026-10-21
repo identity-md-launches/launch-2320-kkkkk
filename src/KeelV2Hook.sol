@@ -11,12 +11,14 @@ import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {SwapParams, ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {BeforeSwapDelta, toBeforeSwapDelta} from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
-import {IRulesModule, IKeelGovernance} from "./interfaces/IRulesModule.sol";
+import {IRulesModule, IKeelGovernance, IPulseSource} from "./interfaces/IRulesModule.sol";
+import {IKeelHeart} from "./interfaces/IKeelHeart.sol";
 import {Guard} from "./libraries/Guard.sol";
 import {QuoteTransfer} from "./libraries/QuoteTransfer.sol";
+import {PulseMath} from "./libraries/PulseMath.sol";
 
 /// @notice Immutable shared hook. All fee assets and beneficiary credits live here.
-contract KeelV2Hook is Guard {
+contract KeelV2Hook is Guard, IPulseSource {
     using PoolIdLibrary for PoolKey;
 
     error OnlyPoolManager();
@@ -41,6 +43,9 @@ contract KeelV2Hook is Guard {
     uint256 public constant INACTIVITY = 30 days;
     uint160 public constant PERMISSION_FLAGS =
         (1 << 12) | (1 << 11) | (1 << 7) | (1 << 6) | (1 << 3) | (1 << 2);
+    /// @notice Hard ceiling on the gas a heart notification may consume.
+    uint256 public constant HEART_GAS = 200_000;
+    uint256 public constant ONE_BEAT = 1e18;
     IPoolManager public immutable poolManager;
     address public immutable factory;
 
@@ -61,8 +66,21 @@ contract KeelV2Hook is Guard {
     mapping(address => uint256) public totalUnclaimed;
     mapping(bytes32 => uint256) public creatorEarned;
     mapping(bytes32 => uint256) public teamEarned;
-    mapping(bytes32 => uint256) private _expectedBuyInput;
 
+    struct PendingBuy {
+        uint128 gross;
+        uint128 net;
+    }
+
+    struct Pulse {
+        uint128 pulse;
+        uint64 updatedAt;
+    }
+
+    mapping(bytes32 => PendingBuy) private _pendingBuys;
+    mapping(bytes32 => Pulse) private _pulses;
+
+    event HeartCallFailed(bytes32 indexed poolId);
     event PoolRegistered(
         bytes32 indexed poolId,
         address indexed token,
@@ -181,13 +199,13 @@ contract KeelV2Hook is Guard {
         uint256 amount = uint256(-params.amountSpecified);
         (uint256 fee, uint256 creatorAmount) = splitFee(amount, base, effective);
         if (fee >= amount) revert InvalidAmount();
-        _expectedBuyInput[id] = amount - fee;
+        _pendingBuys[id] = PendingBuy(uint128(amount), uint128(amount - fee));
         _accrue(id, pool, fee, creatorAmount);
         return (IHooks.beforeSwap.selector, toBeforeSwapDelta(int128(int256(fee)), 0), 0);
     }
 
     function afterSwap(
-        address,
+        address sender,
         PoolKey calldata key,
         SwapParams calldata params,
         BalanceDelta delta,
@@ -196,13 +214,16 @@ contract KeelV2Hook is Guard {
         bytes32 id = PoolId.unwrap(key.toId());
         Pool storage pool = _pool(id);
         bool isBuy = _isBuy(pool, key, params.zeroForOne);
-        int128 quoteDelta = Currency.unwrap(key.currency0) == pool.quote ? delta.amount0() : delta.amount1();
+        bool quoteIsZero = Currency.unwrap(key.currency0) == pool.quote;
+        int128 quoteDelta = quoteIsZero ? delta.amount0() : delta.amount1();
         if (isBuy) {
             // Reject partial fills: the input fee must never be charged on unspent quote.
             // Snapshot before the swap: a future module may quote from changing pool state.
-            uint256 expected = _expectedBuyInput[id];
-            delete _expectedBuyInput[id];
-            if (expected == 0 || int256(quoteDelta) != -int256(expected)) revert PartialBuy();
+            PendingBuy memory pending = _pendingBuys[id];
+            delete _pendingBuys[id];
+            if (pending.net == 0 || int256(quoteDelta) != -int256(uint256(pending.net))) revert PartialBuy();
+            int128 tokenDelta = quoteIsZero ? delta.amount1() : delta.amount0();
+            _beat(id, pool, sender, pending.gross, tokenDelta > 0 ? uint256(uint128(tokenDelta)) : 0, context);
             return (IHooks.afterSwap.selector, 0);
         }
         if (quoteDelta <= 0) return (IHooks.afterSwap.selector, 0);
@@ -230,6 +251,17 @@ contract KeelV2Hook is Guard {
         returns (uint16 base, uint16 effective)
     {
         return _rates(id, _pool(id), isBuy, context);
+    }
+
+    /// @inheritdoc IPulseSource
+    function pulseOf(bytes32 id) public view returns (uint256) {
+        Pulse memory pulse = _pulses[id];
+        return PulseMath.decay(pulse.pulse, block.timestamp - pulse.updatedAt);
+    }
+
+    function pulseInfo(bytes32 id) external view returns (uint128 pulse, uint64 updatedAt) {
+        Pulse memory stored = _pulses[id];
+        return (stored.pulse, stored.updatedAt);
     }
 
     function transferCreator(address token, address newCreator) external nonReentrant {
@@ -295,6 +327,41 @@ contract KeelV2Hook is Guard {
                     START_RATE - pool.launchBaseRate, pool.decaySeconds - elapsed, pool.decaySeconds
                 );
             if (scheduled > effective) effective = uint16(scheduled);
+        }
+    }
+
+    /// @dev Pulse and heart accounting for a completed buy. Never reverts because of the heart.
+    function _beat(
+        bytes32 id,
+        Pool storage pool,
+        address sender,
+        uint256 gross,
+        uint256 tokensOut,
+        bytes calldata context
+    ) private {
+        address heart = IKeelGovernance(factory).heart();
+        if (heart != address(0)) {
+            uint256 threshold;
+            try IKeelHeart(heart).minBuy(pool.quote) returns (uint256 value) {
+                threshold = value;
+            } catch {
+                emit HeartCallFailed(id);
+                return;
+            }
+            if (gross < threshold) return;
+        }
+        Pulse storage pulse = _pulses[id];
+        uint256 current = PulseMath.decay(pulse.pulse, block.timestamp - pulse.updatedAt) + ONE_BEAT;
+        pulse.pulse = current > type(uint128).max ? type(uint128).max : uint128(current);
+        pulse.updatedAt = uint64(block.timestamp);
+        // Only the configured router can name a buyer, and only with exactly one ABI-encoded address.
+        if (heart == address(0) || context.length != 32 || sender != IKeelGovernance(factory).router()) {
+            return;
+        }
+        address buyer = abi.decode(context, (address));
+        try IKeelHeart(heart).onBuy{gas: HEART_GAS}(pool.token, pool.quote, buyer, gross, tokensOut) {}
+        catch {
+            emit HeartCallFailed(id);
         }
     }
 

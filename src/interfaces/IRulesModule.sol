@@ -12,7 +12,14 @@ interface ICreatorActivity {
     function creatorAction(bytes32 poolId, address actor) external;
 }
 
+interface IPulseSource {
+    /// @notice Decayed buy counter of a pool, 1e18 per buy, half-life one hour.
+    function pulseOf(bytes32 poolId) external view returns (uint256);
+}
+
 interface IKeelGovernance {
     function teamRecipient() external view returns (address);
     function takeoverContract() external view returns (address);
+    function router() external view returns (address);
+    function heart() external view returns (address);
 }

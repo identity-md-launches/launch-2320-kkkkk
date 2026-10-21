@@ -1,4 +1,4 @@
-# Keel v2 — contracts, part 1
+# Keel v2 — contracts, parts 1 and 2a
 
 Keel creates immutable Uniswap v4 pools with a fixed-supply token, permanently locked liquidity and quote-denominated launch fees. This deliverable contains contracts, a simulation-only deployment script and tests. It does not deploy or broadcast transactions. Example launch metadata uses **kkkkk / lllll**.
 
@@ -27,6 +27,98 @@ Tests cover checkpoint history (including zero iterations and multiple changes i
 
 The final validation passed **55 offline checks** (plus one explicit fork-only skip) and **56 mainnet-fork checks**, with no failures. The required fuzz seed and a second seed at 1,024 runs both passed. A clean source-only export also passed offline build/tests/format and Slither with zero high-severity results. Exact commands, contract sizes and medium-report dispositions are in [REVIEW.md](REVIEW.md).
 
+## Part 2a: heart, pulse fees, launch permit and launch fee
+
+Part 2a continues part 1 in place: nothing is deployed, so `KeelV2Factory`, `KeelV2Hook` and the test router were changed directly. Everything stays immutable: no proxies, no upgrade paths, no sweep or rescue functions, no admin power over funds already credited. Validation with the verifier seed: **107 offline tests passed, 0 failed, 1 explicit mainnet-only skip** (two invariant suites at 128 runs × 32 depth each), `forge fmt --check` clean, all runtime sizes below 24,576 bytes (factory 14,638, hook 11,641, heart 6,005, PulseRateModule 1,979).
+
+### What changed in part 1 code
+
+- `KeelV2Factory.launch` is now `payable` and takes `(name, symbol, metadata, quote, startTick, baseFeeBps, deadline, signature)`. It requires `msg.value == launchFee`, a live signer, `block.timestamp <= deadline` and a valid EIP-712 permit; the per-quote tick bounds, rate and metadata checks are unchanged. The fee is forwarded to `teamRecipient` at the end of the same call and the launch reverts (`FeeTransferFailed`) if that transfer fails.
+- `KeelV2Hook.afterSwap` now reads the swap `sender`, keeps the gross buy input next to the net input it already snapshotted, updates the pool's pulse and notifies the heart. `hookData` is still forwarded to the module unchanged.
+- `FixedRateModule` keeps its exact behaviour but inherits the creator controls from the new abstract `RateModuleBase`, which `PulseRateModule` also uses. Its custom errors are therefore declared on `RateModuleBase`.
+- `QuoteTransfer` gained `pull` (checked `transferFrom`) for heart funding.
+
+### Launch permit and fee (factory)
+
+| Item | Value |
+|---|---|
+| EIP-712 domain | name `Keel`, version `2`, `chainId`, `verifyingContract` = factory. `DOMAIN_SEPARATOR()` is recomputed per call, so a chain fork invalidates old permits. |
+| Typed data | `Launch(address creator,address quote,int24 startTick,uint256 deadline,uint256 nonce)`; `creator = msg.sender`, `nonce = nonces(creator)`, which increments on use. `launchDigest(creator, quote, startTick, deadline, nonce)` returns the digest to sign. |
+| Signature | 65 bytes `r ‖ s ‖ v`, `v ∈ {27, 28}`, low-`s` only, recovered address must equal `signer()`. Malleated or replayed signatures revert `InvalidSignature`; late ones revert `PermitExpired`. |
+| `signer()` | Owner-set via `setSigner(address)`, replaceable, nonzero, unset after deployment. Launches revert `NotConfigured` until it is set. Replacing the signer invalidates every unused permit. |
+| `launchFee()` | Default `0.0001 ether`; `setLaunchFee(uint256)` up to `MAX_LAUNCH_FEE = 0.01 ether`. `msg.value` must equal it exactly (`WrongFee`), including zero when the fee is zero. The factory never holds ETH. |
+| `router()` / `heart()` | `setRouter(address)` and `setHeart(address)`: owner, once, nonzero, must have code, cannot be changed or cleared (same pattern as `setTakeoverContract`). |
+
+The off-chain signer picks `startTick` so that every token starts at a $5,000 market cap; the contract only checks that the tick is a multiple of 60 inside the quote's configured bounds. The tick is part of the signed message, so a creator cannot substitute another one.
+
+### Buyer identity and heart notification (hook)
+
+A buy is *counted* for the heart only when the swap `sender` seen by PoolManager equals `factory.router()` and `hookData` is exactly 32 bytes; `buyer = abi.decode(hookData, (address))`. Any other caller, or the router with other hook data, trades normally and gets no heart credit. A spoofed 32-byte payload from another router is ignored because the sender check fails. After a counted buy whose gross quote input is at least `heart.minBuy(quote)`, the hook calls `heart.onBuy(token, quote, buyer, grossQuoteIn, tokensOut)` with a fixed `HEART_GAS = 200_000` stipend inside `try/catch`. A reverting or gas-burning heart never reverts or changes the swap; the hook emits `HeartCallFailed(poolId)` instead. `tokensOut` is the token amount PoolManager delivered for that swap. A reverting `minBuy` is treated the same way (event, no pulse, no credit). The property "swap deltas are identical with and without a heart" is fuzz-tested by replaying the same sequence on a state snapshot with the heart masked out.
+
+### Pulse (hook)
+
+Each pool keeps `pulse` (uint128, `1e18` = one buy) and `pulseUpdatedAt`. On every buy with gross input ≥ `heart.minBuy(quote)` (every buy while no heart is set, and every buy of a quote whose threshold is zero), `pulse = pulse · 2^(−elapsed / 1 h) + 1e18`, saturating at `uint128.max`. `pulseOf(poolId)` returns the decayed value now; `pulseInfo(poolId)` returns the raw pair. `PulseMath.decay` caps elapsed at 64 half-lives (then zero), uses a 16-bit fraction of a half-life with sixteen Q64 constants (relative error below 2·10⁻⁵), and cannot overflow or revert for any `uint128` value and any `uint256` elapsed time. Whole half-lives are exact right shifts. The anti-snipe decay from part 1 is unchanged and independent of the pulse.
+
+### PulseRateModule
+
+`feeBps(poolId) = 100 + (rate − 100) · min(pulse, HOT) / HOT`, `HOT = 6e18`, `rate` = the creator's current rate (100..500) with the same `lowerRate`, `scheduleRaise` (24 h, +1% max), `applyRaise`, `cancelRaise` and `creatorAction` wiring as `FixedRateModule`. The result is always in `100..rate`. The module is view-only and reads `hook.pulseOf`; the pulse used for a buy is the value before that buy is counted. Register it with `factory.registerModule(address(new PulseRateModule(hook)))`; existing pools keep their module.
+
+### KeelHeart
+
+One heartbeat for all v2 pools, deployed as `new KeelHeart(hook, owner)` (no external calls in the constructor). The owner (two-step `transferOwnership`/`acceptOwnership`) can only `setMinBuy(quote, rawAmount)` and `addQuote(quote)` (at most 16, no removal). There is no withdrawal, pause or override.
+
+| Rule | Behaviour |
+|---|---|
+| `onBuy` | Hook only. Ignored if `minBuy[quote] == 0` or `grossQuoteIn < minBuy[quote]`. If a round is over (`deadline != 0 && now >= deadline`) it is ended first. With no round running: `deadline = now + 300`, round number +1. Otherwise `deadline = min(deadline + 30, now + 600)`. Records `lastBuyer`, `lastToken`, `lastTokens = tokensOut`. Emits `Beat(round, buyer, token, quote, grossQuoteIn, deadline)`. |
+| `fund(quote, amount)` | Anyone, listed quotes only. ETH via `msg.value` (`quote = address(0)`), ERC20 via `transferFrom` with an exact balance-change check. Adds to the running pot. Emits `Funded(round, quote, from, amount)`. |
+| `end()` | Anyone once `now >= deadline`; a running round always has a buyer. Winner = `lastBuyer`, eligible iff `lastToken.balanceAt(winner, block.number − 1) >= lastTokens`. `balanceAt` still reverts for the current block, so nothing done inside the `end()` block (or the block of the buy that ends a round) can count. Eligible: every listed quote's prize is 70% of its pot, 30% carries over. Not eligible: nothing is awarded and the whole pot carries over. Emits `Flatline(round, winner, eligible)`. The next round starts on the next counted buy. |
+| `claim(round, to)` | Winner only, once, pays every quote's prize to `to` with exact transfer checks, `nonReentrant`, and a solvency check `balance >= liability` (pot + unpaid prizes) before and after each payout. Emits `Claimed(round, winner, to)`. |
+| Views | `state()` → `(round, deadline, lastBuyer, lastToken)`; `quoteList()`; `potOf(quote)`; `minBuy(quote)`; `prizeOf(round, quote)`; `result(round)` → `(winner, token, endBlock, eligible, claimed)`; plus `lastTokens()`, `eligibleRounds()`, `liability(quote)`, `anchorCount(quote)`. |
+
+Pots are split lazily. Ending a round stores only its result and, when eligible, its ordinal among eligible rounds. Each quote keeps a short list of funding anchors `(ordinal, amount)`: funding settles the pot through the current ordinal and records the new total. `potOf` and `prizeOf` walk forward from the latest anchor before the requested ordinal, taking 70% per eligible round; the walk stops once a prize rounds to zero. This keeps `onBuy` O(1) regardless of how many quotes are listed and makes claims cost O(quotes) with no per-round loop in the hot path. `liability[quote] = funded − claimed` equals `potOf + Σ unpaid prizes` at all times (invariant-tested).
+
+### Gas
+
+`forge snapshot --match-contract GasWith` (`.gas-snapshot`). Each test is exactly one swap of 0.01 ETH through the test router after an identical setup, so the totals include the router's own overhead and are comparable across rows. The "with heart" column has a funded heart with `minBuy(ETH) = 0.001 ether`.
+
+| Swap through the test router | No heart set | Heart set |
+|---|---:|---:|
+| Plain buy (empty hookData) | 319,609 | 324,064 |
+| Router buy naming a buyer (counted → round starts) | 345,370 | 404,615 |
+| Non-router buy with a 32-byte payload (ignored) | 345,311 | 354,438 |
+| Sell | 428,684 | 428,615 |
+| Two counted buys, second one extends the running round | — | 662,489 (second buy ≈ 258k, warm) |
+| Two counted buys, second one ends round 1 inside `onBuy` and starts round 2 | — | 781,900 (second buy ≈ 377k, warm) |
+
+Direct `heart.onBuy` cost measured from the hook's call site (`test_onBuyGasOnEveryPath`, asserted ≤ 120,000 on every path):
+
+| Path | Gas |
+|---|---:|
+| Ignored (below `minBuy`) | 25,433 |
+| Ignored (quote without threshold) | 25,645 |
+| Round start | 73,885 |
+| Extension | 39,677 |
+| Previous round ends ineligible, new round starts | 96,760 |
+| Previous round ends eligible (winner with 400 checkpoints), new round starts | 119,766 |
+
+The eligible-end path grows by about 2,100 gas each time the winner's checkpoint history doubles (one storage read per binary-search step). With the 200,000 stipend as the hard ceiling, a history of more than roughly 2^38 checkpoints would be needed before the heart call fails, in which case the swap still succeeds and `HeartCallFailed` is emitted.
+
+Extra cost of a counted buy over part 1: a plain buy with no heart set costs about 8k more than the part 1 swap (one warm pulse write and one `factory.heart()` read; the first buy of a pool pays a cold 22k pulse slot instead). A counted buy with the heart running costs **about 85k more than a plain buy** (404,615 vs 319,609): the `router()` read, the `minBuy` read, the 200k-stipend call and the heart's own 74k round-start work. Ending a round inside `onBuy` adds up to another ~46k.
+
+### After launch (part 2a settings)
+
+| Setter | Value | Where the owner gets it |
+|---|---|---|
+| `factory.setSigner(signer)` | The address of the off-chain permit signer. Required before any launch. | The backend key that computes start ticks for the $5,000 market cap. |
+| `factory.setLaunchFee(fee)` | Optional; default 0.0001 ether, at most 0.01 ether. | Product decision. |
+| `factory.setRouter(router)` | The production router that forwards `abi.encode(buyer)` as hook data. Once only. | The router deployment of the site (not the test router). |
+| `factory.setHeart(heart)` | The deployed `KeelHeart(hook, owner)`. Once only. | The heart deployment; constructor needs the hook address and the owner multisig. |
+| `heart.addQuote(quote)` | Each quote whose pot the heart should hold (ETH is `address(0)`), at most 16, never removable. | Same allowlist as `configureQuote`. |
+| `heart.setMinBuy(quote, raw)` | Gross raw-unit threshold for a buy to count. Zero means buys of that quote never count. | Product decision per quote. |
+| `factory.registerModule(pulseModule)` | Optional: switch future launches to `PulseRateModule(hook)`. | Deployed module bound to this hook. |
+
+Operational notes: the heart's eligibility rule reads the end-of-previous-block balance, so a winner must hold `lastTokens` through the block before `end()` or the ending buy; tokens received by transfer count, tokens moved inside the ending block do not. Anyone can call `end()`; the site should do so promptly after the deadline because a late counted buy also ends the round (and starts a new one owned by that buyer). Pots are only ever paid to winners; the owner cannot move them. The router must send exactly `abi.encode(buyer)`; a payload with dirty upper bytes reverts that router swap only. The heart holds every listed quote in one contract, so the same owner attestation that applies to `configureQuote` (standard, non-rebasing tokens) applies to `addQuote`.
+
 ## Contracts and parameters
 
 | Contract / operation | Parameters and meaning |
@@ -36,7 +128,7 @@ The final validation passed **55 offline checks** (plus one explicit fork-only s
 | `KeelV2Hook(poolManager, factory)` | Nonzero manager and immutable factory. Its address must carry exactly permission bits `0x18cc`. |
 | `FixedRateModule(hook)` | Immutable nonzero hook. No owner or funds-moving methods. |
 | `factory.initialize(hook, module)` | One-time wiring by the contract that constructed the factory, called atomically by the dry-run script. Verifies manager/factory/module bindings. The bootstrap has no subsequent authority. |
-| `factory.launch(name, symbol, metadata, quote, startTick, baseFeeBps)` | Name 1–64 bytes, symbol 1–16 bytes, metadata 0–2048 bytes. Metadata is uninterpreted and immutable. Quote must be allowlisted. Rate 100–500 bps. Tick must be a multiple of 60 inside the quote's allowed interval. Returns `(token, poolId)`. Caller is creator. No ETH/payment is accepted at launch. |
+| `factory.launch(name, symbol, metadata, quote, startTick, baseFeeBps, deadline, signature)` | Name 1–64 bytes, symbol 1–16 bytes, metadata 0–2048 bytes. Metadata is uninterpreted and immutable. Quote must be allowlisted. Rate 100–500 bps. Tick must be a multiple of 60 inside the quote's allowed interval. `msg.value == launchFee`, forwarded to the team. `deadline` and `signature` form the EIP-712 permit described in part 2a. Returns `(token, poolId)`. Caller is creator. |
 | `hook.rates(poolId, isBuy, context)` | Current module base rate and effective rate, in bps. The module receives the swap's hook data unchanged. FixedRateModule ignores direction/context. |
 | `hook.splitFee(amount, base, effective)` | Pure raw-unit fee calculator. `100 <= base <= 500`, `base <= effective <= 9900`. Returns total fee and creator share. |
 | `module.lowerRate(poolId, newRate)` | Creator only, strictly lower, at least 100 bps; cancels a pending raise. |

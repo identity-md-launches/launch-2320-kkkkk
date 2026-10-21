@@ -3,6 +3,7 @@ pragma solidity 0.8.26;
 
 import {KeelTest} from "./support/KeelTest.sol";
 import {FixedRateModule} from "../src/FixedRateModule.sol";
+import {RateModuleBase} from "../src/RateModuleBase.sol";
 import {KeelV2Token} from "../src/KeelV2Token.sol";
 import {KeelV2Hook} from "../src/KeelV2Hook.sol";
 import {KeelV2Factory} from "../src/KeelV2Factory.sol";
@@ -24,7 +25,7 @@ contract RulesTest is KeelTest {
         (, uint16 pending, uint256 eta) = module.rates(id);
         assertEq(pending, 0);
         assertEq(eta, 0);
-        vm.expectRevert(FixedRateModule.NoPendingRaise.selector);
+        vm.expectRevert(RateModuleBase.NoPendingRaise.selector);
         module.applyRaise(id);
         vm.stopPrank();
     }
@@ -36,7 +37,7 @@ contract RulesTest is KeelTest {
         module.scheduleRaise(id, 400);
         assertEq(module.feeBps(id, false, ""), 300);
         vm.warp(start + 1 days - 1);
-        vm.expectRevert(FixedRateModule.RaiseNotReady.selector);
+        vm.expectRevert(RateModuleBase.RaiseNotReady.selector);
         module.applyRaise(id);
         vm.warp(start + 1 days);
         module.applyRaise(id);
@@ -44,7 +45,7 @@ contract RulesTest is KeelTest {
         module.scheduleRaise(id, 500);
         module.cancelRaise(id);
         vm.warp(start + 3 days);
-        vm.expectRevert(FixedRateModule.NoPendingRaise.selector);
+        vm.expectRevert(RateModuleBase.NoPendingRaise.selector);
         module.applyRaise(id);
         vm.stopPrank();
     }
@@ -54,22 +55,22 @@ contract RulesTest is KeelTest {
         vm.expectRevert(KeelV2Hook.NotCreator.selector);
         module.lowerRate(id, 200);
         vm.startPrank(creator);
-        vm.expectRevert(FixedRateModule.InvalidRate.selector);
+        vm.expectRevert(RateModuleBase.InvalidRate.selector);
         module.lowerRate(id, 99);
-        vm.expectRevert(FixedRateModule.InvalidRate.selector);
+        vm.expectRevert(RateModuleBase.InvalidRate.selector);
         module.lowerRate(id, 300);
-        vm.expectRevert(FixedRateModule.InvalidRate.selector);
+        vm.expectRevert(RateModuleBase.InvalidRate.selector);
         module.scheduleRaise(id, 401);
-        vm.expectRevert(FixedRateModule.InvalidRate.selector);
+        vm.expectRevert(RateModuleBase.InvalidRate.selector);
         module.scheduleRaise(id, 501);
-        vm.expectRevert(FixedRateModule.InvalidRate.selector);
+        vm.expectRevert(RateModuleBase.InvalidRate.selector);
         module.scheduleRaise(id, 300);
-        vm.expectRevert(FixedRateModule.NoPendingRaise.selector);
+        vm.expectRevert(RateModuleBase.NoPendingRaise.selector);
         module.cancelRaise(id);
         vm.stopPrank();
-        vm.expectRevert(FixedRateModule.OnlyHook.selector);
+        vm.expectRevert(RateModuleBase.OnlyHook.selector);
         module.initialize(id, 100);
-        vm.expectRevert(FixedRateModule.UnknownPool.selector);
+        vm.expectRevert(RateModuleBase.UnknownPool.selector);
         module.feeBps(bytes32(uint256(7)), true, "");
     }
 
@@ -81,7 +82,7 @@ contract RulesTest is KeelTest {
         vm.warp(start + 23 hours);
         module.scheduleRaise(id, 400);
         vm.warp(start + 24 hours);
-        vm.expectRevert(FixedRateModule.RaiseNotReady.selector);
+        vm.expectRevert(RateModuleBase.RaiseNotReady.selector);
         module.applyRaise(id);
         vm.warp(start + 47 hours);
         module.applyRaise(id);
