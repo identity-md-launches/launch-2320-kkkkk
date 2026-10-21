@@ -1,4 +1,4 @@
-# Keel v2 — contracts, parts 1 and 2a
+# Keel v2 — contracts, parts 1, 2a and 2b
 
 Keel creates immutable Uniswap v4 pools with a fixed-supply token, permanently locked liquidity and quote-denominated launch fees. This deliverable contains contracts, a simulation-only deployment script and tests. It does not deploy or broadcast transactions. Example launch metadata uses **kkkkk / lllll**.
 
@@ -118,6 +118,75 @@ Extra cost of a counted buy over part 1: a plain buy with no heart set costs abo
 | `factory.registerModule(pulseModule)` | Optional: switch future launches to `PulseRateModule(hook)`. | Deployed module bound to this hook. |
 
 Operational notes: the heart's eligibility rule reads the end-of-previous-block balance, so a winner must hold `lastTokens` through the block before `end()` or the ending buy; tokens received by transfer count, tokens moved inside the ending block do not. Anyone can call `end()`; the site should do so promptly after the deadline because a late counted buy also ends the round (and starts a new one owned by that buyer). Pots are only ever paid to winners; the owner cannot move them. The router must send exactly `abi.encode(buyer)`; a payload with dirty upper bytes reverts that router swap only. The heart holds every listed quote in one contract, so the same owner attestation that applies to `configureQuote` (standard, non-rebasing tokens) applies to `addQuote`.
+
+## Part 2b: KeelV2Router (ETH in, ETH out)
+
+`src/KeelV2Router.sol` lets every buyer pay and receive plain ETH in one transaction, whatever the pool's quote (ETH, USDC, IMD, wBTC, wSOL…). Buyers never hold the quote. Same rules as before: immutable, no proxy, no sweep or rescue, Solidity 0.8.26 / Cancun / via IR / `bytecode_hash = none`, vendored deps only (the router uses v4-core alone; no v4-periphery). Nothing was deployed. Runtime size 12,979 bytes.
+
+### Routes
+
+One route per quote, set by the router owner with `setRoute(quote, Route{kind, v4Key, v3Pool})`:
+
+| Kind | Meaning | Checked at `setRoute` |
+|---|---|---|
+| `NATIVE` | The quote is ETH (`address(0)`); no first hop. | `quote == address(0)`, other fields empty. |
+| `V4` | A Uniswap v4 pool `(ETH, quote, any fee, any tick spacing, hooks)`. | `currency0 == ETH`, `currency1 == quote`, pool initialized, `hooks == 0` or allowlisted. |
+| `V3` | A Uniswap v3 WETH/quote pool. The router wraps/unwraps WETH itself. | Pool has code; `{token0, token1} == {WETH, quote}`; quote is not WETH. |
+| `NONE` | Removes the route (reverts if none was set). | — |
+
+Every kind also requires `factory.quotes(quote).enabled` (the factory owner's no-fee/no-rebase attestation), and that `factory.hook()` and `factory.poolManager()` match the router's immutables (the constructor makes no external call, so the wiring is checked here on first use). Replacing a route deletes the previous one completely. The v4 hook allowlist (`setHookAllowed(hooks, bool)`) starts empty, every change emits `HookAllowlistChanged`, and it is re-checked on every trade, so un-allowlisting a hook immediately stops routes through it. Route changes never move funds: the router holds no balance between transactions.
+
+### Buy and sell
+
+- `buy(token, minTokensOut, deadline) payable`: looks up the pool by `hook.poolIdOf(token)` and `hook.poolInfo(id).quote`. The Keel `PoolKey` is derived (sorted token/quote, fee 0, tick spacing 60, the hook: the only shape `registerPool` accepts) and checked against the registered pool id, so it equals `factory.launchInfo(token).key` without loading the launch metadata string. All of `msg.value` is swapped ETH → quote (exact input) by the route, the full quote output goes into the Keel pool (exact input) with `hookData = abi.encode(msg.sender)`, and tokens are taken straight to `msg.sender`.
+  - NATIVE / V4: one `unlock`. ETH is **settled first** (`sync(ETH)`, `settle{value}`), then the v4 hop (V4 only), then the Keel swap, then `take(token)`. The v4 hop's quote credit pays the Keel swap inside PoolManager; the quote never leaves it.
+  - V3: wrap → v3 swap (WETH paid in `uniswapV3SwapCallback`) → one `unlock` that settles the received quote **before** the Keel swap (so a quote with no PoolManager inventory still works) → `take(token)`.
+- `sell(token, amountIn, minEthOut, deadline)`: `transferFrom(msg.sender)` only (exact balance checked), one `unlock`: settle tokens, Keel swap with empty hook data (sells never touch the heart), then NATIVE: take ETH; V4: v4 hop quote → ETH inside the same unlock, take ETH; V3: take the quote, v3 swap to WETH inside the unlock, unwrap after. ETH is sent with `call`; failure reverts (`EthTransferFailed`).
+- Reverts: `Expired` when `block.timestamp > deadline`; `InsufficientOutput` below the minimum; `InvalidAmount` for 0 or more than `int128.max`; `PartialFill` if any hop (v4, v3, or the Keel sell leg) does not consume its whole input; `ZeroOutput` if any hop yields nothing (1 wei buys and sells that round to zero ETH always revert); `NonStandardBalance` if any quote/token/WETH receipt or settlement differs from the amount the pool reported (fee-on-transfer or rebasing quote); the hook's own `PartialBuy`/`NonStandardQuote`/`InvalidAmount` propagate unchanged.
+- Events: `Bought(buyer, token, ethIn, tokensOut)`, `Sold(seller, token, tokensIn, ethOut)`.
+- Heart credit: the hook credits a buyer only when PoolManager's `sender` is `factory.router()`. Once `factory.setRouter(KeelV2Router)` is done, router buys credit `msg.sender`; the router address itself is never named. A direct pool call naming somebody else is ignored (tested).
+
+### Quotes
+
+`quoteBuy(token, ethIn)` and `quoteSell(token, amountIn)` are revert-with-result simulations: the router calls itself (`simulate`, self-only), runs the **same code path** as the trade (both hops, the current hook fee including the launch decay and `PulseRateModule`'s pulse, the module's hook-data input), and unwinds with `QuoteResult(amount)`. Call them with `eth_call` from the buyer's address (hook data is `abi.encode(msg.sender)`, as in `buy`). Tests assert exact equality of quote and trade in the same state for every route type, at fixed sizes, at 1,000 ETH / 50 ETH / 100 ETH, and in a fuzz test over all three routes.
+
+Simulation limit: an `eth_call` carries no ETH, so a simulated buy skips the ETH settle. The hook takes its buy fee from PoolManager during the swap, so on the **NATIVE** route `quoteBuy` needs PoolManager to already hold at least the fee in ETH (mainnet PoolManager holds thousands of ETH; the trade itself is unaffected because it settles first). V4 quote inventory exists by construction (it is the v4 pool's own liquidity), and on V3 the simulation really receives the quote from the v3 pool and settles it.
+
+### Safety
+
+`buy`, `sell`, `quoteBuy` and `quoteSell` share one `nonReentrant` lock. `unlockCallback` requires `msg.sender == poolManager` and a transient flag the router arms right before its own `unlock`, consumed on entry. `uniswapV3SwapCallback` requires `msg.sender` to equal the exact pool the router is calling right now (transient slot, consumed on entry), and pays only the exact input amount; a pool that asks for a different amount, skips the callback or delivers a different output reverts the trade. No call targets come from users: only PoolManager, WETH, the hook/factory views, the route's pools, the token being traded and the caller (ETH refund). `receive()` accepts ETH only from PoolManager and WETH. At the end of every buy and sell the router compares its ETH, token, quote and WETH balances with the start of the call and reverts on any difference (`BalanceChanged`). Tokens someone pushes to the router stay there untouched; they are never swept or spent.
+
+### Tests (part 2b)
+
+`test/KeelV2Router.t.sol` (38 tests, one fuzz), `test/RouterGas.t.sol` (19 gas rows), `test/RouterMainnetFork.t.sol` (3 fork tests, skipped without a fork). Mocks are in `test/support/RouterMocks.sol`: WETH9, a constant-product v3 pool that follows v3's send-then-callback-then-balance-check protocol (with a cap to emulate a stopped swap and a callback-skip switch), an impostor v3 pool that forges deltas, a v4 liquidity helper, a positively rebasing quote and an ETH-rejecting seller. The V4 route uses a real v4 ETH/USDC pool in the vendored PoolManager. Covered: buy/sell per route with exact quotes, heart credit to `msg.sender` (ETH and USDC routes), sells not touching the heart, spoofed hook data, slippage and deadline (incl. the deadline second itself), 1 wei buys, 1 wei sells, zero amounts, `int128` bounds, 1,000/5,000 ETH trades, selling more than the pool can take (`PartialFill`), v3 and v4 partial fills, fee-on-transfer quote on V4 (hook rejects) and V3 (router rejects), rebasing quote, unattested quote refused by `setRoute`, route validation, hook allowlist, route replacement V4 → V3 → V4 and removal, ownership, constructor and wiring checks, callback authentication, reentrancy through an ETH receiver, ETH-rejecting seller, and router balances zero after every call.
+
+Mainnet fork (`forge test --fork-url <rpc> --match-contract RouterMainnetForkTest`): on 2026-10-22 at the then-latest block (~26,244,050, publicnode) all three passed: NATIVE, V3 through the USDC/WETH 0.05% pool `0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640` with WETH9 `0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2`, and V4 through the ETH/USDC fee 500 / tick spacing 10 / no-hook pool (skipped if that pool is not initialized at the chosen block). The pool's `token1()` was read on chain and is WETH. The older archive block 22,000,000 was not reachable from this machine.
+
+### Gas (part 2b)
+
+`forge snapshot --match-contract 'GasWith|RouterGasTest'` (`.gas-snapshot`). Same warmed setup for each row: heart set and its round running, every pool traded once. Small = 0.001 ETH, typical = 0.1 ETH (sells: a token amount worth about that). Router buys are counted heart buys (they name the buyer); the direct rows are single-pool swaps through the part 1 test router with no buyer named.
+
+| Route | Router buy small / typical | Router sell small / typical | Direct single-pool swap of the same size | Router overhead |
+|---|---|---|---|---|
+| NATIVE | 351,820 / 351,606 | 370,814 / 375,860 | Keel ETH buy 323,822 / 324,033; sell 425,201 / 429,972 | buy **+28k** (heart credit included); sell **−54k** (the test router's transfer path is heavier) |
+| V4 (ETH/USDC v4 + Keel USDC) | 408,340 / 408,882 | 434,381 / 440,779 | Keel USDC buy 411,621 / 412,041; v4 ETH→USDC hop alone 125,408 | buy **−3k** against the Keel swap alone and **−129k** against the two swaps done separately: the quote never leaves PoolManager |
+| V3 (mock WETH/BTC v3 + Keel BTC) | 433,298 / 433,914 | 484,014 / 483,860 | Keel quote buy ≈ 411,621 (USDC row) | buy **+22k** over the Keel swap alone, including the mock v3 hop |
+
+The V3 figures use the mock pool; a real v3 swap costs more than the mock (tick crossing, oracle writes), so mainnet V3 rows will be higher; it was not measured here. The direct rows go through the part 1 test router, which has its own costs (it pulls the input with `transferFrom`, then settles and takes separately), so a negative overhead means the production router's path is leaner than that harness, not cheaper than the pool. Overhead per route over a bare Keel swap: NATIVE ≈ +28k (mostly the counted heart beat plus `poolInfo` lookup and balance checks), V4 ≈ +0k (the v4 hop is paid for by not transferring the quote in and out), V3 ≈ +22k plus the real v3 swap.
+
+### After launch (part 2b settings)
+
+Constructor: `KeelV2Router(poolManager, factory, hook, weth, owner)` — 5 arguments, no external calls. On mainnet: PoolManager `0x000000000004444c5dc75cB358380D2e3dE08A90`, WETH9 `0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2`, the Keel factory and hook of this deployment, and the launch owner (`$owner`).
+
+| Setter | Value | Where the owner gets it |
+|---|---|---|
+| `factory.setRouter(router)` | This router. Once only; required for heart credit. | The router deployment. |
+| `router.setRoute(address(0), NATIVE)` | Required before ETH pools trade through the router. | — |
+| `router.setRoute(quote, V4 key)` or `(quote, V3 pool)` | One per enabled quote (USDC, IMD, wBTC, wSOL…). Until set, trades of that quote revert `RouteNotSet(quote)`. | The deepest ETH/quote pool on the launch chain: a v4 PoolKey (hook-less, or hook allowlisted first) or a v3 WETH/quote pool address. Verify the v3 pool is from Uniswap's canonical v3 factory; the router only checks its token pair. |
+| `router.setHookAllowed(hooks, true)` | Only if a chosen v4 ETH/quote pool has a hook. | Audit the hook first. |
+| `router.transferOwnership(next)` / `acceptOwnership()` | Two-step; the router owner has no access to funds. | Owner multisig. |
+
+Trust and operations: the router owner can only point quotes at pools. A bad route (thin or manipulated pool, malicious v3 contract) cannot take more than the trade's own input and is bounded by the user's `minTokensOut` / `minEthOut`; the site must always pass a real minimum from `quoteBuy`/`quoteSell` with a slippage margin, and a near deadline. The router is the factory's set-once router, so it cannot be replaced; route changes are the only lever. A quote whose issuer later adds a transfer fee or rebasing makes its trades revert (no dust is left); the owner should then remove its route.
 
 ## Contracts and parameters
 

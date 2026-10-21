@@ -33,6 +33,22 @@ This is an implementation self-review, not an independent audit. No deployment o
 
 Part 2a remaining limits: the holding check costs about 2.1k gas per doubling of the winner's checkpoint history, so an extreme history (more than ~2^38 checkpoints) would exhaust the 200k stipend and the round would only end through `end()`. The heart trusts `KeelV2Token.balanceAt`, which only factory-created tokens provide; the hook only registers such tokens. Lazy pot settlement means `prizeOf`/`potOf` walk at most ~150 eligible rounds (the pot rounds to zero after that) per anchor. A quote added to the heart after rounds have run has a zero pot for earlier rounds. The owner's only powers are thresholds and the quote list; a wrong `minBuy` can only make buys not count.
 
+## Part 2b findings and disposition (KeelV2Router)
+
+| Finding | Disposition and evidence |
+|---|---|
+| A quote with no PoolManager inventory makes the hook's fee `take` fail if input is settled after the swap. | Buys settle ETH (NATIVE/V4) or the received quote (V3) before the Keel swap. V4 hops never take the quote out: the hop's credit pays the Keel swap. |
+| Partial fills strand input in the router or PoolManager. | Every v4 hop, the v3 hop and the Keel sell leg must consume exactly the input (`PartialFill`); the hook still rejects partial buys. Tested with a capped v3 pool, a thin v4 pool and an oversized sell. |
+| Rounding to zero leaves the user with nothing. | Any zero-output hop reverts (`ZeroOutput`); 1 wei buys and sells revert on every route (tested). |
+| Taxed or rebasing quotes leave dust or misprice. | `setRoute` requires the factory's quote attestation; every receipt, settle and take is compared against the reported amount (`NonStandardBalance`); end-of-call balance-delta check on ETH/token/quote/WETH (`BalanceChanged`). Taxed USDC (V4, rejected by the hook), taxed BTC (V3, rejected by the router) and a rebasing quote are tested, router balances zero afterwards. |
+| Callback spoofing. | `unlockCallback` needs PoolManager plus a transient flag armed just before the router's own `unlock` and consumed on entry; `uniswapV3SwapCallback` needs the exact pool being called (transient, consumed). Direct calls, calls from the real pool outside a swap, forged deltas and a skipped callback all revert (tested). |
+| Quotes diverging from trades. | Quotes run the same code path in a reverted self-call; exact equality tested per route, at large sizes, in a fresh pool under launch-fee decay, and fuzzed. Documented limit: NATIVE `quoteBuy` needs PoolManager ETH ≥ the hook fee, because `eth_call` carries no ETH to settle (tested both sides). |
+| Heart credit theft. | Router buys pass `abi.encode(msg.sender)`; sells and quotes do not change heart state (tested); direct pool calls naming another buyer give no credit (tested). |
+| Reentrancy through the seller's ETH receipt. | Shared `nonReentrant` on buy/sell/quotes; a re-entering receiver makes the sell revert (`EthTransferFailed`, tested). |
+| Owner power. | Routes and the v4 hook allowlist only; no function moves funds. A malicious route is bounded by user minimums (documented trust assumption). |
+
+Part 2b remaining limits: the v3 route trusts the owner to name a canonical Uniswap v3 pool (only the token pair is checked on chain). The gas figures for V3 use a mock pool. The router has not had an independent review; Slither was not run in this part.
+
 ## Static-analysis dispositions
 
 The high-severity-only Slither run finished with **0 results** after the following changes, without detector suppression or path exclusions:
@@ -68,6 +84,21 @@ The medium-inclusive run reported **34 medium findings**, grouped below. It inte
 The owner is trusted to admit standard quotes and audited immutable modules. External quote issuers and Uniswap governance remain outside Keel's control. There is no emergency sweep, freeze, pool-module replacement, LP recovery, or repair mechanism for a malicious module or insolvent rebasing quote. These are deliberate consequences of the requested immutability. Timestamp-based deadlines are subject to ordinary block timestamp precision; no randomness or spot-price oracle is used.
 
 The takeover contract, production router/frontend, final quote allowlist and bounds, and actual owner/team deployment addresses are operator decisions for the later release. The supplied dry run leaves takeover unset and quote allowlisting empty. An independent review is still required before using real funds.
+
+## Validation results (part 2b)
+
+Completed on 2026-10-22 with the pinned Solidity 0.8.26 configuration and the verifier's fuzz seed `0xb688bb59da1324624d076c92cf39b3f13fc247aab29d8417aec855f24653754e`:
+
+| Check | Result |
+|---|---|
+| `forge build` | Passed. Router runtime 12,979 bytes (factory 14,638, hook 11,641 unchanged). |
+| `forge test --fuzz-seed 0xb688…754e` | **164 passed, 0 failed, 4 fork-only skips** across 21 suites (38 router tests, 19 router gas rows). |
+| `forge test --fork-url <publicnode> --match-contract RouterMainnetForkTest` | 3 passed (NATIVE, V3 USDC/WETH 0.05%, V4 ETH/USDC 500/10) at the latest mainnet block on 2026-10-22. |
+| `forge fmt --check` | Passed. |
+| `forge snapshot --match-contract 'GasWith\|RouterGasTest'` | Recorded in `.gas-snapshot`; table in the README. |
+| Slither | Not run in this part. |
+
+No part 1 or part 2a source was changed.
 
 ## Validation results (part 2a)
 
